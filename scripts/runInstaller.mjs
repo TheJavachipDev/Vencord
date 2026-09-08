@@ -18,7 +18,7 @@
 
 import "./checkNodeVersion.js";
 
-import { execFileSync, execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { Readable } from "stream";
@@ -121,8 +121,26 @@ console.log("Now running Installer...");
 const argStart = process.argv.indexOf("--");
 const args = argStart === -1 ? [] : process.argv.slice(argStart + 1);
 
-try {
-    execFileSync(installerBin, args, {
+const discordAsar = "/Applications/Discord.app/Contents/Resources/app.asar";
+
+function isDevPatched() {
+    try {
+        return existsSync(discordAsar)
+            && readFileSync(discordAsar).includes("Vencord/dist/patcher.js");
+    } catch {
+        return false;
+    }
+}
+
+// Dev installs load from dist/ live. Re-injecting is only needed if Discord is unpatched.
+if (args.includes("--install") && isDevPatched()) {
+    console.log("Discord is already patched to this Vencord dist — skipping installer.");
+    console.log("Fully quit Discord (Cmd+Q) and reopen to load your latest pnpm build.");
+    process.exit(0);
+}
+
+await new Promise((resolve, reject) => {
+    const child = spawn(installerBin, args, {
         stdio: "inherit",
         env: {
             ...process.env,
@@ -130,6 +148,55 @@ try {
             VENCORD_DEV_INSTALL: "1"
         }
     });
-} catch {
+
+    let settled = false;
+    const done = ok => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        clearTimeout(hardTimeout);
+        try {
+            if (!child.killed) child.kill("SIGTERM");
+        } catch { }
+        if (ok) resolve();
+        else reject(new Error("Installer failed"));
+    };
+
+    // macOS installer often hangs after a successful patch.
+    const poll = setInterval(() => {
+        if (isDevPatched()) {
+            console.log("Detected successful Vencord patch; stopping hung installer.");
+            done(true);
+        }
+    }, 1000);
+
+    child.on("error", err => {
+        clearInterval(poll);
+        clearTimeout(hardTimeout);
+        reject(err);
+    });
+
+    child.on("exit", code => {
+        clearInterval(poll);
+        clearTimeout(hardTimeout);
+        if (settled) return;
+        settled = true;
+        if (isDevPatched() || code === 0) resolve();
+        else reject(new Error(`Installer exited with code ${code}`));
+    });
+
+    const hardTimeout = setTimeout(() => {
+        if (isDevPatched()) {
+            console.log("Installer timed out, but patch is present.");
+            done(true);
+        } else {
+            console.error("Installer timed out without a successful patch.");
+            done(false);
+        }
+    }, 45000);
+}).catch(error => {
     console.error("Something went wrong. Please check the logs above.");
-}
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+});
+
